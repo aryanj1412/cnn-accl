@@ -1,0 +1,39 @@
+# Vivado generated folders
+*.cache/
+*.runs/
+*.sim/
+*.hw/
+*.gen/
+*.ip_user_files/
+
+# Vivado temporary system folder
+.Xil/
+
+# Log files
+*.jou
+*.log
+*.str
+
+# Implementation artifacts
+*.dcp
+*.bit
+*.bin
+*.ltx
+
+# Simulation files
+*.wdb
+*.wcfg
+
+# Reports
+*.rpt
+
+# Backup / temporary
+*.tmp
+*.backup
+
+# IP cache
+ip_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
