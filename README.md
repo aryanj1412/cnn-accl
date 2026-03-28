@@ -34,7 +34,7 @@ CNN-ACCL is a CNN accelerator design project that implements convolution, poolin
 
 ---
 
-## Repository Structure
+## Repo Structure
 
 ```
 cnn-accl/
