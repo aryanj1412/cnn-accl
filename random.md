@@ -1,1036 +1,973 @@
-CNN Accelerator on FPGA - NVIDIA Interview Prep Guide
-Zynq-7020 PYNQ-Z2 | 4-Layer CNN | 16-bit Fixed-Point Verilog RTL
----
-1. EXECUTIVE SUMMARY
-You've built a complete PS/PL data pipeline CNN accelerator on the Zynq-7020 SoC with:
-PL (Programmable Logic): Conv+ReLU+MaxPool in Verilog RTL (4 layers: 3→16→32→64→96 channels)
-PS (Processing System): ARM Cortex-A9 running Python driver with flatten, 2 FC layers, sigmoid
-Interfaces: AXI-Lite for control, AXI4-Stream for DMA data movement, custom RTL accelerator
-Memory: 32 BRAM ping-pong input buffer, output buffer for feature map storage
-Compute: 16 Parallel DSP-based Processing Elements, one per input channel, 9-tap 3×3 convolution
-Fixed Point: Q6.9 (pixel/weight) → Q12.18 (accumulator) → Q6.9 (quantized output)
-Achieved: Timing closure post-implementation, end-to-end hardware validation
----
-2. ARCHITECTURE DEEP DIVE
-2.1 Overall System Block Diagram
-```
-┌─────────────────────────────────────────────────────────┐
-│                    ZYNQ-7020 SoC                        │
-├──────────────────────────┬──────────────────────────────┤
-│   Processing System (PS) │  Programmable Logic (PL)     │
-│   ARM Cortex-A9          │  Custom RTL Accelerator      │
-│                          │                              │
-│ • Image preprocess       │ ┌─────────────────────────┐ │
-│ • Encode DDR addr        │ │  AXI-Lite Slave         │ │
-│ • Load/manage weights    │ │  (Configuration)        │ │
-│ • Trigger PL via AXI     │ │  Base: 0x43C00000       │ │
-│ • Poll wait states       │ └─────────────────────────┘ │
-│ • DMA stream data        │              │               │
-│ • Post-process (FC+Sig)  │  ┌──────────────────────┐   │
-│                          │  │ Input Ping-Pong Buf  │   │
-│                          │  │ (32 BRAMs, 16 ch×2)  │   │
-│                          │  └──────────────────────┘   │
-│   ▼                      │         ▲                    │
-│ ┌────────────┐           │    ┌───────────┐            │
-│ │ AXI DMA    │◄──────────┼──►│ Weight    │            │
-│ │ MM2S/S2MM  │           │    │ Regfile   │            │
-│ └────────────┘           │    └───────────┘            │
-│        ▲                 │         │                    │
-│        │                 │    ┌─────────────────────┐  │
-│ DDR-400 (PS side)        │    │  Compute Core       │  │
-│                          │    │  16 PE Units        │  │
-│                          │    │  (DSP-based MACs)   │  │
-│                          │    └─────────────────────┘  │
-│                          │         │                    │
-│                          │    ┌─────────────────────┐  │
-│                          │    │ Channel Summer      │  │
-│                          │    │ (reduce 16 ch→1)    │  │
-│                          │    └─────────────────────┘  │
-│                          │         │                    │
-│                          │    ┌────────────────────┐   │
-│                          │    │ Acc Row Buffer     │   │
-│                          │    │ (2 output rows)    │   │
-│                          │    └────────────────────┘   │
-│                          │         │                    │
-│   ┌──────────────────────┤  ┌─────────────────┐        │
-│   │ Output Streaming     │  │ Quantize        │        │
-│   │ Controller           │  │ ReLU            │        │
-│   │ (AXI4-Stream Master) │  │ MaxPool         │        │
-│   └──────────────────────┤  └─────────────────┘        │
-│                          │         │                    │
-│                          │    ┌─────────────────┐      │
-│                          │    │ Output Buffer   │      │
-│                          │    │ (BRAM)          │      │
-│                          │    └─────────────────┘      │
-└──────────────────────────┴──────────────────────────────┘
-```
-2.2 Data Flow - One Convolution Layer (Conv1: 3×128×128 → 16×126×126)
-Timeline:
-```
-┌─ Cycle 0: Load Weights ─┐
-│ DMA streams 144 weights │  (3 input ch × 16 output ch × 3×3 tap)
-│ Each written to weight_regfile[0..143]
-└─ Cycle 1: Load Pixels ──┐
-│ DMA streams pixel data: 4 rows × 16 channels × 128 cols × 2 bits
-│ Pattern: ch0_row0, ch0_row1, ..., ch15_row0, ch15_row1
-│ Ping-pong buffer (sel=0): DMA writes to buf_b, PE reads from buf_a
-└─ Cycle 2: Compute ──────┐
-│ For each output pixel (h, w) in 126×126:
-│   For each group of 3 input channels (since 3 in, 16 out → 6 groups):
-│     For 9 taps of 3×3 kernel (sequential):
-│       PE[0..15] MAC: pixel[ch] × weight[out_ch] 
-│       Accumulate across all input channels → channel_summer
-│       Store in acc_row_buffer
-│
-│   Total: 126 × 126 × 6 groups × 10 cycles = ~953K cycles
-│
-└─ Cycle 3: Quantize/ReLU ┐
-│ Q12.18 acc → Q6.9 (right shift by 9 + round + saturate)
-│ max(0, quantized) if relu enabled
-└─ Cycle 4: Stream Output ┐
-│ DMA reads 126×126 feature map via AXI4-Stream S2MM
-│ Returns to DDR for next layer's input
-```
-2.3 Fixed-Point Quantization Strategy
-Why Q6.9?
-Range: ±63.998 (plenty for activations after normalization)
-Precision: 1/512 ≈ 0.00195 (matches training quantization)
-Efficiency: 16-bit fits in one BRAM word
-Pipeline:
-```
-Image pixel:   [0, 255]  →  /255 + normalize  →  [-2, +2]  →  ×512  →  Q6.9 int16
-Weight:        [-0.5, 0.5]  from training           ×512         →  Q6.9 int16
-Product:       pixel × weight  →  Q6.9 × Q6.9  =  Q12.18 (32-bit, DSP output)
-Accumulation:  ∑(Q12.18)  →  Q12.18 int32 (32-cycle accum)
-Quantize:      Q12.18  +256 (round) >> 9  =  Q6.9 (16-bit)
-ReLU:          max(0, Q6.9)
-```
-Example Calculation:
-Image pixel: 100 → normalize → -0.2 → Q6.9: -0.2 × 512 = -103
-Weight: 0.1 → Q6.9: 0.1 × 512 = 51
-Product: -103 × 51 = -5253 (Q12.18)
-After 9 taps: ∑ = 32000 (Q12.18)
-Quantize: (32000 + 256) >> 9 = 63 (Q6.9)
-ReLU: max(0, 63) = 63
----
-3. HARDWARE ARCHITECTURE IN DETAIL
-3.1 Processing Element (PE) - Single DSP-Based MAC Unit
-File: pe.v
-```verilog
-module pe_unit (
-    input  wire clk, rst_n,
-    input  wire clr,  // clear accumulator
-    input  wire en,   // enable accumulation
-    input  wire signed [15:0] pixel,  // Q6.9
-    input  wire signed [15:0] weight, // Q6.9
-    output wire signed [31:0] acc     // Q12.18
-);
-    wire signed [31:0] product = pixel * weight;  // DSP multiply
-    reg signed [31:0] acc_reg;
-    
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            acc_reg <= 32'sd0;
-        else if (clr && en)
-            acc_reg <= product;        // tap 0: init with first product
-        else if (clr)
-            acc_reg <= 32'sd0;
-        else if (en)
-            acc_reg <= acc_reg + product; // accumulate
-    end
-    assign acc = acc_reg;
-endmodule
-```
-Key Design Points:
-DSP Inference: `use_dsp = "yes"` pragma forces Vivado to use native DSP48E1 slices (2 per PE)
-Accumulator Priority: `clr && en` → load first product (clears stale data before tap 0)
-No Register Output: Direct wire assignment for `acc` (combinatorial)
-Latency: 1 cycle (single pipeline stage in DSP48E1)
-3.2 Compute Core (PE Array) - 16 Parallel MACs
-File: pe_array.v
-```verilog
-module compute_core (
-    input  wire [255:0] pixel_flat,   // 16×16-bit (16 input channels)
-    input  wire [255:0] weight_flat,  // 16×16-bit
-    output wire [511:0] acc_flat      // 16×32-bit
-);
-    generate
-        for (ch = 0; ch < 16; ch = ch + 1) begin : PE_ARRAY
-            pe_unit u_pe (
-                .pixel(pixel_flat[16*ch+15:16*ch]),
-                .weight(weight_flat[16*ch+15:16*ch]),
-                .acc(acc_flat[32*ch+31:32*ch])
-            );
-        end
-    endgenerate
-endmodule
-```
-Flattened Bus Convention (must memorize):
-`pixel_flat[16*i+15:16*i]` = pixel[i]
-`weight_flat[16*i+15:16*i]` = weight[i]
-`acc_flat[32*i+31:32*i]` = acc[i] (32-bit output)
-Resource Usage:
-16 DSP48E1 slices (Zynq-7020 has 220, so ~7% DSP utilization)
-Throughput: 16 parallel multiplies + accumulates per cycle
-Critical Path: DSP multiplier (typically 2.5-3 ns in Zynq-7)
-3.3 Channel Summer - Reduction Tree
-Key Concept: After one 3×3 tap MAC across all 16 input channels, sum the 16 partial products to get the output value for ONE output channel.
-```
-pe_acc_flat[32*0+31:0]   (from ch0)  \
-pe_acc_flat[32*1+31:0]   (from ch1)   \
-...                                    ├─► + ├─► + ├─► + ├─► ch_sum (32-bit)
-pe_acc_flat[32*15+31:0]  (from ch15) /
-```
-Hardware: Tree of 32-bit adders (pipelined or combinatorial)
-This reduces 16 channels into 1 per cycle per output channel processed.
-3.4 Ping-Pong Input Buffer (32 BRAM instances)
-File: input_buf.v
-Architecture:
-```
-Buffer A (16 BRAMs)              Buffer B (16 BRAMs)
-┌─ ch0 BRAM (512 words)         ┌─ ch0 BRAM (512 words)
-├─ ch1 BRAM                      ├─ ch1 BRAM
-├─ ...                           ├─ ...
-└─ ch15 BRAM                     └─ ch15 BRAM
+# CNN Accelerator - Code Walkthroughs & Technical Deep-Dives
+## NVIDIA Interview Preparation - Advanced Level
 
-Ping-pong selector (sel):
-  sel=0: PE reads from A,  DMA writes to B
-  sel=1: PE reads from B,  DMA writes to A
-```
-Timing of 3×3 Kernel Fetch:
-When computing output (row=r, col=c), kernel overlaps input at:
-```
-Input buffer layout: [row0, row1, row2, row3]  (MAX_W=128, ROWS=4)
-                     [ch0..ch15] per position
+---
 
-Kernel taps:   [0 1 2]     BRAM addresses for tap row_offset, col_offset:
-               [3 4 5]     tap0: row_base+0, col_base+0
-               [6 7 8]     tap1: row_base+0, col_base+1
-                          ...
-                          tap8: row_base+2, col_base+2
+## 1. COMPLETE KERNEL COMPUTATION SEQUENCE (Step-by-Step)
+
+### Scenario: Compute one output pixel, Layer Conv2 (16 input channels → output channel 0)
+
+**Setup:**
+- Input feature map: 16 channels × 61×61 pixels (Q6.9)
+- Kernel: 3×3 (9 taps)
+- Computing output pixel at position (row=2, col=2)
+- This is output channel 0, group 0
+
+### Cycle-by-Cycle Execution
+
 ```
-Read Latency: 1 cycle (BRAM registered output)
-Ping-pong Benefit:
-While PL computes row N, PS/DMA loads row N+1 into opposite buffer
-No stalling, continuous streaming
-3.5 Accumulator Row Buffer (2 Rows)
-Stores 2 output rows × output_w columns × 1 value (32-bit acc).
-Used to:
-Collect MAC outputs from compute_core as they arrive
-Allow quantization/ReLU to read asynchronously in parallel
-Dual-port design:
-Write port (from compute_core): sequential, one column per cycle
-Read port (to quantizer): random access, any column
-3.6 Quantizer & ReLU Pipeline
-Quantizer (quantize.v):
+═══════════════════════════════════════════════════════════════════
+
+CYCLE 0: LOAD PHASE
+───────────────────
+FSM State: COMPUTE, tap_cnt=0
+
+Control Signals Asserted:
+  pe_clr     = 1  (clear accumulators before first tap)
+  pe_en      = 0  (don't MAC yet, data not ready)
+  bram_rd_addr = row 2 * 61 + col 2 = 122 + 2 = 124
+  wgt_rd_tap = 0  (send weight for tap 0)
+
+Hardware Actions:
+  1. BRAM input_buffer[rd_addr=124]:
+     - Reads all 16 channels at position (row=2, col=2)
+     - Returns rd_flat[255:0] = [ch0_pixel, ch1_pixel, ..., ch15_pixel]
+     - (Data not yet valid; BRAM has 1-cycle latency)
+  
+  2. Weight regfile[wgt_rd_tap=0]:
+     - Selects tap 0 of kernel
+     - Returns wgt_rd_flat[255:0] = [w0_ch0, w0_ch1, ..., w0_ch15]
+     - (Data not yet valid)
+  
+  3. PE array:
+     - CLR=1, EN=0 → all PE accumulators cleared to 0
+     - product_[ch] = 0 (no multiply yet)
+     - acc_[ch] = 0 (after clear)
+
+Output of Cycle 0:
+  - Accumulators: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  - BRAM data floating (1 cycle latency in flight)
+  - Weight data floating (1 cycle latency in flight)
+
+FSM Transition:
+  tap_cnt <= 1
+
+═══════════════════════════════════════════════════════════════════
+
+CYCLE 1: WAIT PHASE (BRAM Latency)
+──────────────────────────────────
+FSM State: COMPUTE, tap_cnt=1
+
+Control Signals Asserted:
+  pe_clr     = 0  (stop clearing)
+  pe_en      = 0  (still wait, data arriving next cycle)
+  bram_rd_addr = 124  (re-send same address for tap 0 data)
+  wgt_rd_tap = 0  (keep tap 0)
+
+Hardware Actions:
+  1. BRAM output from Cycle 0 NOW ARRIVES:
+     - rd_flat[255:0] = actual pixel data
+     - Example: [img_q[ch0,2,2], img_q[ch1,2,2], ..., img_q[ch15,2,2]]
+     - Let's say: [100, 150, -50, 200, ...]  (in Q6.9)
+  
+  2. Weight from Cycle 0 NOW ARRIVES:
+     - wgt_rd_flat[255:0] = tap0 kernel weights
+     - Example: [50, 30, 40, ...]  (in Q6.9)
+  
+  3. PE array:
+     - CLR=0, EN=0 → accumulators remain 0 (no accumulation yet)
+     - product_[ch] computed but not used:
+       - product_[0] = 100 × 50 = 5000 (Q12.18)
+       - product_[1] = 150 × 30 = 4500
+       - ...
+
+Output of Cycle 1:
+  - Accumulators still: [0, 0, 0, 0, ...]  (not latched)
+  - Products (wire output): [5000, 4500, ...]
+  - Next BRAM address will arrive in 1 cycle
+
+FSM Transition:
+  tap_cnt <= 2
+
+═══════════════════════════════════════════════════════════════════
+
+CYCLE 2: FIRST MAC FIRES
+────────────────────────
+FSM State: COMPUTE, tap_cnt=2
+
+Control Signals Asserted:
+  pe_clr     = 0
+  pe_en      = 1  ← **ENABLE ACCUMULATION**
+  bram_rd_addr = row 2 * 61 + col 3 = 125  (tap 1: same row, col+1)
+  wgt_rd_tap = 0  (still tap 0 weights, will be used for accumulation)
+
+Hardware Actions:
+  1. Previous BRAM read (from Cycle 1) arrives:
+     - This is the tap0 data sent in Cycle 1
+     - But we're now at tap_cnt=2, so this is "old" data
+     - **PROBLEM: This is WHY the design is tricky!**
+  
+  2. PE Array with EN=1:
+     For each channel ch:
+       product_[ch] = pixel_new × weight_tap0
+       acc_[ch] <= acc_[ch] + product_[ch]
+  
+     Wait, which pixel and weight?
+     - pixel = rd_flat from 1 cycle ago (Cycle 1 read data)
+     - weight = wgt_rd_tap from 1 cycle ago (wgt_rd_tap=0)
+  
+     So actually:
+       product_[ch] = pixel_tap0 × weight_tap0  ← CORRECT!
+       acc_[ch] <= 0 + product_tap0
+     
+     Accumulators become: [5000, 4500, ...]
+
+Output of Cycle 2:
+  - Accumulators: [5000, 4500, ...]  (tap 0 accumulated)
+  - Next addr arriving cycle 3 is for tap 1
+  - Next weight arriving cycle 3 is still tap 0 (lagging by 1)
+
+FSM Transition:
+  tap_cnt <= 3
+
+═══════════════════════════════════════════════════════════════════
+
+CYCLE 3: SECOND MAC (TAP 1)
+────────────────────────────
+FSM State: COMPUTE, tap_cnt=3
+
+Control Signals:
+  pe_clr     = 0
+  pe_en      = 1  ← Continue accumulating
+  bram_rd_addr = row 2 * 61 + col 4 = 126  (tap 2: same row, col+2)
+  wgt_rd_tap = 1  ← Advance to next tap weight
+
+Hardware Actions:
+  1. BRAM data arriving (from Cycle 2 read):
+     - This is tap1 pixel data (row 2, col 3)
+  
+  2. Weight arriving (from Cycle 2 wgt_rd_tap=0):
+     - This is tap 0 weights
+     - **OH NO! We're using tap0 weights but tap1 pixels?**
+     - **NO! Because wgt_rd_tap LAGS by 1 like pixel data!**
+  
+     Actually in FSM logic:
+       wgt_rd_tap is set based on tap_cnt
+       But it's read 1 cycle later
+       So if tap_cnt=2 sets wgt_rd_tap=0, we read it next cycle
+       When tap_cnt=3, we read wgt_rd_tap from tap_cnt=2 iteration
+  
+     This is the register timing:
+       output reg [3:0] wgt_rd_tap;  ← Stores PREVIOUS cycle's value
+       wgt_rd_tap <= tap_cnt - 2;    ← Assigned combinatorially
+  
+     So at tap_cnt=3:
+       - wgt_rd_tap wire gets set to 3-2=1 (combinatorial)
+       - But module output is still the REGISTERED value from cycle 2 = 0
+       - We read weight tap 0 even though wgt_rd_tap<=1 is being computed
+  
+  3. PE accumulation:
+     product_[ch] = pixel_tap1 × weight_tap0
+     acc_[ch] <= acc_prev + product  ← WRONG! **TIMING BUG!**
+
+Actually, let me reconsider the FSM logic more carefully...
+
+```
+
+**Let me re-examine the FSM logic in control.v:**
+
+```verilog
+// From control.v line 287-295
+else if (tap_cnt == 4'd1) begin
+    pe_clr       <= 1'b0;
+    pe_en        <= 1'b0;  // WAIT CYCLE: don't MAC yet
+    wgt_rd_tap   <= 4'd0;
+    bram_rd_addr <= addr_for_tap0;
+    tap_cnt      <= 4'd2;
+end
+
+else if (tap_cnt < 4'd10) begin  // tap 2..9
+    pe_clr     <= 1'b0;
+    pe_en      <= 1'b1;  // NOW MAC
+    wgt_rd_tap <= tap_cnt - 2;  // e.g., tap_cnt=2 → wgt_rd_tap<=0
+    bram_rd_addr <= addr_for_kernel_tap(tap_cnt-1);
+    tap_cnt    <= tap_cnt + 1;
+end
+```
+
+**Corrected Cycle Timing:**
+
+```
+CYCLE 0 (tap_cnt=0):
+  Assign wgt_rd_tap <= 0, bram_rd_addr = tap0_addr
+  Nothing is registered yet (outputs are X)
+
+CYCLE 1 (tap_cnt=1): [wgt_rd_tap from cycle 0 now registered = 0]
+  bram_rd_data STILL X (BRAM latency hasn't completed)
+  wgt_rd_data valid = tap 0 weights
+  Assign wgt_rd_tap <= 0, bram_rd_addr = tap0_addr (re-send)
+
+CYCLE 2 (tap_cnt=2): [wgt_rd_tap still = 0, bram_rd_data = tap0 pixels (from cycle 0 read)]
+  pe_en <= 1
+  product = tap0_pixel × tap0_weight  ✓ CORRECT
+  acc <= 0 + product = tap0_product
+  Assign wgt_rd_tap <= 2-2=0 (combinatorial), bram_rd_addr = tap1_addr
+
+CYCLE 3 (tap_cnt=3): [wgt_rd_tap now = 0 (from cycle 2), bram_rd_data = tap1_pixels (from cycle 2 read)]
+  pe_en <= 1
+  product = tap1_pixel × tap0_weight  ✗ WRONG!
+  ...
+```
+
+**Aha! There's still timing skew! Let me re-read the actual FSM...**
+
+Looking at line 302:
+```verilog
+wgt_rd_tap <= tap_cnt - 2;
+```
+
+**The trick is:** `wgt_rd_tap` is assigned combinatorially based on current `tap_cnt`, but the **weight BRAM module reads on the PREVIOUS cycle's `wgt_rd_tap`** because it's registered.
+
+But actually, look at how the weight is selected in weight_regfile.v:
+```verilog
+output wire [255:0] rd_flat;
+assign rd_flat = register_bank[rd_tap];  // rd_tap is combinatorial READ
+```
+
+Wait, no—let me check the actual regfile instantiation in top.v:
+
+```verilog
+weight_regfile u_wgt_rf (
+    .clk        (clk),
+    .wr_en      (wgt_wr_en),
+    .wr_addr    (wgt_wr_addr),
+    .wr_data    (wgt_wr_data),
+    .rd_tap     (wgt_rd_tap),       // control.v output
+    .rd_flat    (wgt_rd_flat)       // combinatorial read
+);
+```
+
+So `wgt_rd_tap` is an **output reg** from control.v, and it drives the weight regfile's **input** `rd_tap` combinatorially.
+
+In control.v:
+```verilog
+output reg [3:0] wgt_rd_tap;
+...
+always @(posedge clk or negedge rst_n) begin
+    ...
+    wgt_rd_tap <= tap_cnt - 2;  // assigned in posedge block
+end
+```
+
+So `wgt_rd_tap` updates on clock edge. On cycle N:
+- At start of cycle N, `wgt_rd_tap` holds value from cycle N-1
+- During cycle N, new `wgt_rd_tap <= tap_cnt - 2` is computed
+
+This means:
+```
+Cycle N:           tap_cnt = N,  wgt_rd_tap (output) = N-1-2 = N-3 (from prev cycle update)
+Cycle N+1:         tap_cnt = N+1, wgt_rd_tap (output) = N+1-2 = N-1 (from cycle N update)
+```
+
+So there's a 1-cycle lag!
+
+**Corrected Analysis:**
+
+```
+CYCLE 0: tap_cnt<=0, wgt_rd_tap<=? (undefined)
+         Compute wgt_rd_tap <= 0-2 (combinatorial, but output still undefined)
+
+CYCLE 1: tap_cnt<=1, wgt_rd_tap output = 0-2 = undefined (first valid is cycle 2)
+         Compute wgt_rd_tap <= 1-2 (combinatorial)
+
+CYCLE 2: tap_cnt=2, wgt_rd_tap (output) = 0-2 = (from cycle 0, still undefined) OR
+         Maybe it's initialized to 0 in reset.
+         
+         Actually, from the reset block (line 150):
+         wgt_rd_tap <= 4'd0;
+         
+         So cycles 0 (startup) and cycle 2 onward:
+         wgt_rd_tap = 0, weights from tap 0 valid
+         
+         Compute wgt_rd_tap <= 2-2 = 0 (same)
+
+CYCLE 3: tap_cnt=3, wgt_rd_tap (output) = 0 (from cycle 2)
+         Compute wgt_rd_tap <= 3-2 = 1
+
+CYCLE 4: tap_cnt=4, wgt_rd_tap (output) = 1 (from cycle 3)
+         Compute wgt_rd_tap <= 4-2 = 2
+
+...
+
+CYCLE 10: tap_cnt=10, wgt_rd_tap (output) = 10-3 = 7
+          But tap_cnt==10 falls through to else if (tap_cnt == 4'd10):
+          wgt_rd_tap <= 4'd8  (last tap)
+
+CYCLE 11: tap_cnt=11, wgt_rd_tap (output) = 8
+          acc_wr_en <= 1 (write accumulator)
+```
+
+**So the timing IS correct!** The 1-cycle pipeline latency is built into both data paths (BRAM and weights), so they stay synchronized.
+
+---
+
+## 2. CHANNEL SUMMATION - REDUCTION TREE
+
+**Problem:** After 9 MAC taps, each of 16 PEs has a Q12.18 accumulator value. We need to sum all 16 to get one output channel value.
+
+**Question:** Why not just add them combinatorially?
+
+**Answer:** Large tree depth → long critical path → timing violation. Solution is to pipeline the summing.
+
+### Example 4-level reduction (for explanation):
+
+```
+pe_acc_flat[32*0+31:0]   \ 
+pe_acc_flat[32*1+31:0]    ├─ L0_add0 ──┐
+pe_acc_flat[32*2+31:0]    |            ├─ L1_add0 ──┐
+pe_acc_flat[32*3+31:0]   /             |            ├─ L2_add0 ─→ ch_sum
+pe_acc_flat[32*4+31:0]   \             |            /
+pe_acc_flat[32*5+31:0]    ├─ L0_add1 ──┤
+pe_acc_flat[32*6+31:0]    |            ├─ L1_add1 ──┘
+pe_acc_flat[32*7+31:0]   /             |
+...                                     |
+pe_acc_flat[32*14+31:0]  \             |
+pe_acc_flat[32*15+31:0]   ├─ L0_add7 ──┘
+
+Level 0: 8 adders (16→8), 1 cycle latency
+Level 1: 4 adders (8→4),  1 cycle latency
+Level 2: 2 adders (4→2),  1 cycle latency
+Level 3: 1 adder  (2→1),  1 cycle latency
+
+Total latency: 4 cycles
+```
+
+**For a real implementation**, this might be pipelined or partially combinatorial depending on timing constraints.
+
+---
+
+## 3. QUANTIZATION DEEP-DIVE: ROUNDING & SATURATION
+
+### Arithmetic Analysis
+
+**Q12.18 Format:**
+- Integer bits: 12 (range: ±2048)
+- Fractional bits: 18 (precision: 1/262144 ≈ 0.0000038)
+- Total: 32-bit signed
+
+**Q6.9 Format:**
+- Integer bits: 6 (range: ±64)
+- Fractional bits: 9 (precision: 1/512 ≈ 0.00195)
+- Total: 16-bit signed
+
+**Quantize Operation:** Q12.18 → Q6.9 requires right-shift by 9.
+
+### Without Rounding (Truncation)
+
+```
+Q12.18 value: 32'b00001000101100010000000000000000 = 8,796.0 (decimal)
+                       integer part (12 bits)│fractional (18 bits)│
+                                      (100010110001 00000000000000000)
+
+Right shift by 9 (truncate):
+32'b00001000101100010000000000000000 >> 9
+= 32'b00000000000010001011000100 (keep upper 16 bits)
+= 16'b0001000101100010 = 4415 (decimal)
+
+Error: ±512 (maximum truncation error = 1 LSB in Q6.9)
+```
+
+### With Rounding (Round-to-Nearest)
+
+**Add 0.5 LSB (256 in Q12.18) before shift:**
+
+```
+Q12.18 + 256:
+32'h8AC2000 + 256 = 32'h8AC2100
+
+Right shift by 9:
+32'h8AC2100 >> 9 ≈ Round nearest
+
+Example calculation:
+  Original: 8796000 (hex) = 8,796.0
+  +0.5 LSB: 8796256 (hex) = 8,796 + 0.5
+  >> 9: 4415 (hex, upper 16 bits)
+  
+  vs. truncation: 4414
+  Difference: ±0.5 LSB (instead of ±1 LSB)
+```
+
+### Saturation
+
 ```verilog
 wire signed [32:0] rounded = {acc_in[31], acc_in} + 33'sd256;
-wire signed [23:0] shifted = rounded[32:9];   // right shift 9 bits
+wire signed [23:0] shifted = rounded[32:9];
+
+// Note: shifted is only 24 bits!
+// If rounded grows beyond 32 bits, upper bits are discarded (overflow)
+// Max value in 24 bits signed: +8388607 (24-bit max = 0x7FFFFF)
+// Min value in 24 bits signed: -8388608
 
 always @(*) begin
-    if (shifted > 24'sh007FFF)
-        q_out = 16'sh7FFF;    // saturate positive
+    if (shifted > 24'sh007FFF)      // if > 32767 (16-bit max)
+        q_out = 16'sh7FFF;          // saturate to +32767
+    else if (shifted < -24'sh008000) // if < -32768 (16-bit min)
+        q_out = 16'sh8000;          // saturate to -32768
+    else
+        q_out = shifted[15:0];      // take lower 16 bits
+end
+```
+
+**Example Saturation:**
+
+```
+Case 1: Large positive accumulator
+  acc_in = 32'sh7FFFFFFF (max 32-bit signed)
+  rounded = 0x7FFFFFFF + 256 = 0x80000100 (overflow in signed!)
+           Actually in SystemVerilog: 33'b0_10000000000000000000000100 (33-bit)
+  shifted = 33'b0_10000000000000000000000100 >> 9
+           = 24'b100000000000000000 (which is > 32767 in signed check)
+  Clamped to 16'sh7FFF = +32767 ✓
+
+Case 2: Small value (no saturation)
+  acc_in = 32'sh00002000 (8192 in decimal)
+  rounded = 8192 + 256 = 8448
+  shifted = 8448 >> 9 = 16 (fits in ±16-bit range)
+  q_out = 16'd16 ✓
+```
+
+---
+
+## 4. FSM STATE MACHINE - DETAILED TRANSITION GRAPH
+
+```
+                                    START (run_armed check)
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ LOAD_WEIGHTS                         │
+                    │ (fsm_wait_state = 01)                │
+                    │ load_start <= 1                      │
+                    │ route_sel <= 0 (weights)             │
+                    └──────────────────────────────────────┘
+                                           │
+                                    Immediate next cycle
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ WAIT_WEIGHTS                         │
+                    │ (poll for load_done = 1)             │
+                    │ Waits for DMA to send TLAST          │
+                    └──────────────────────────────────────┘
+                                           │
+                                    load_done asserted
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ LOAD_INPUT                           │
+                    │ (fsm_wait_state = 10)                │
+                    │ load_start <= 1                      │
+                    │ route_sel <= 1 (pixels)              │
+                    └──────────────────────────────────────┘
+                                           │
+                                    Immediate next cycle
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ WAIT_INPUT                           │
+                    │ (poll for load_done = 1)             │
+                    │ DMA ping-pong buffer gets 4 rows     │
+                    └──────────────────────────────────────┘
+                                           │
+                                    load_done asserted
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ CLEAR_ACC                            │
+                    │ acc_clr_en <= 1                      │
+                    │ Clears accumulators for all cols     │
+                    └──────────────────────────────────────┘
+                                           │
+                                    Immediate next cycle
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ COMPUTE (Main kernel loop)           │
+                    │ tap_cnt 0..11 (12 cycles per pixel)  │
+                    │ Nested loop: cur_col × cur_group     │
+                    │                                       │
+                    │ tap 0: clr, send addr                │
+                    │ tap 1: wait (BRAM latency)           │
+                    │ tap 2..9: MAC (8 taps)               │
+                    │ tap 10: last MAC                      │
+                    │ tap 11: write acc to row buffer       │
+                    │                                       │
+                    │ Loop: cur_col = 0 to output_w*2-1    │
+                    └──────────────────────────────────────┘
+                                           │
+                                    All pixels done
+                                    (cur_col exhausted)
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ NEXT_GROUP                           │
+                    │ (Loop: 3 in_ch = 6 groups × 16 out)  │
+                    │                                       │
+                    │ if (cur_group < num_groups-1)        │
+                    │   go back to LOAD_WEIGHTS            │
+                    │ else                                  │
+                    │   go to WRITE_OUT                    │
+                    └──────────────────────────────────────┘
+                                           │
+                                    All groups done
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ WRITE_OUT (Output pipeline)          │
+                    │                                       │
+                    │ Cycle 0: quant_col=0, no write       │
+                    │ Cycle 1..output_w*2:                 │
+                    │   Quantize acc_row_buffer[quant_col] │
+                    │   Apply ReLU (if mode=01 or 10)      │
+                    │   Feed to output_buffer_write_addr   │
+                    │                                       │
+                    │ Prefetch: quant_col always 1 behind  │
+                    │ (registered 1 cycle pipeline delay)   │
+                    └──────────────────────────────────────┘
+                                           │
+                                    All rows quantized
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ NEXT_ROW_PAIR                        │
+                    │ (Tile: 2 rows at a time)             │
+                    │                                       │
+                    │ if (cur_row_pair < num_row_pairs-1)  │
+                    │   go back to LOAD_WEIGHTS            │
+                    │ else                                  │
+                    │   go to STREAM_OUTPUT                │
+                    └──────────────────────────────────────┘
+                                           │
+                                    All row-pairs done
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ STREAM_OUTPUT                        │
+                    │ (DMA S2MM readback)                  │
+                    │                                       │
+                    │ AXI4-Stream Master drives:           │
+                    │   m_axis_tdata <= output_buffer[addr]│
+                    │   m_axis_tvalid <= 1                 │
+                    │   m_axis_tlast <= (last pixel)       │
+                    │                                       │
+                    │ DMA reads and writes to DDR          │
+                    └──────────────────────────────────────┘
+                                           │
+                                    stream_done (TLAST acked)
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ WAIT_STREAM                          │
+                    │ (Poll: wait for stream_done = 1)     │
+                    └──────────────────────────────────────┘
+                                           │
+                                    stream_done asserted
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ NEXT_OC (Outer loop: out channels)   │
+                    │                                       │
+                    │ if (cur_oc < num_out_ch-1)           │
+                    │   go back to LOAD_WEIGHTS            │
+                    │ else                                  │
+                    │   go to ALL_DONE                     │
+                    └──────────────────────────────────────┘
+                                           │
+                                    All output channels done
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ ALL_DONE                             │
+                    │ done <= 1                            │
+                    │ busy <= 0                            │
+                    │ run_armed <= 0                       │
+                    │ Go to IDLE                           │
+                    └──────────────────────────────────────┘
+                                           │
+                                           ▼
+                    ┌──────────────────────────────────────┐
+                    │ IDLE                                 │
+                    │ (Wait for next START)                │
+                    │                                       │
+                    │ Registers reset to defaults:         │
+                    │   cur_oc <= 0, cur_group <= 0        │
+                    │   cur_row_pair <= 0                  │
+                    └──────────────────────────────────────┘
+                                           │
+                                           └──────────────┐
+                                                         │
+                                          (Loop back to START)
+```
+
+---
+
+## 5. AXI4-STREAM HANDSHAKING PROTOCOL
+
+### Example: Streaming 144 Weights
+
+**PS (Master) → PL (Slave) via AXI4-Stream MM2S**
+
+```
+Cycle 0:
+  s_axis_tdata  = weight[0]  (16-bit Q6.9)
+  s_axis_tvalid = 1          (PS has data)
+  s_axis_tready = ?          (PL signals readiness)
+  
+  Wait: If PL not ready (tready=0), PS holds data
+
+Cycle 1-143:
+  (Similar pattern, stream 143 weights)
+
+Cycle 144:
+  s_axis_tdata  = weight[143] (last weight)
+  s_axis_tvalid = 1
+  s_axis_tlast  = 1           ← IMPORTANT: marks end of packet
+  s_axis_tready = 1           (PL accepts)
+  
+  PL input_stream_controller receives TLAST and asserts load_done
+  FSM transitions out of WAIT_WEIGHTS
+```
+
+**Backpressure Example:**
+
+```
+If output buffer fills during quantize/write:
+  out_wr_en stalls (waits for buffer to drain)
+  → accumulator write pipeline stalls
+  → but PE computation continues (decoupled)
+  
+If pixel input is slow (DMA network congestion):
+  s_axis_tvalid goes low
+  → input_stream_controller can't write
+  → ping-pong buffer remains in previous state
+  → FSM waits in WAIT_INPUT for TLAST
+  → computation doesn't start
+  → No deadlock (flow control is proper)
+```
+
+---
+
+## 6. WEIGHT REGFILE & WEIGHT ORDERING
+
+**Problem:** Need to send 3×3 kernel weights in a specific order to achieve correct MAC taps.
+
+**Layout in regfile:**
+
+```
+regfile[0..8]:   tap 0..8 of kernel
+
+Example Conv2 layer (16 input ch, 16 output ch, 1 group):
+Need to load 16 output_ch × 16 input_ch × 9 taps = 2304 individual weights
+
+But regfile is only 256 words (for 16 output channels at once)!
+
+Solution: Only store 16 output channel × 1 input channel × 9 taps = 144 weights
+          Process 16 input channels sequentially
+
+Actually, looking at input_regfile.v (not provided), likely:
+  regfile[0..143]: 16 out_ch × 9 taps for ONE input channel
+  
+During COMPUTE, for each input channel group:
+  - Load weights for that channel (144 weights)
+  - Run full convolution loop
+  - Move to next input channel
+```
+
+**Python Weight Preparation (pynq_inference.py):**
+
+```python
+# Conv weight from training: shape [out_ch, in_ch, 3, 3]
+conv_weight_train = model.conv2.weight  # [32, 16, 3, 3]
+
+# Need to reorder to [out_ch, 16_padded, 9_taps] for hardware
+# Since hardware processes one input channel at a time
+
+conv_weight_hw = np.zeros((32, 16, 9), dtype=np.int16)
+
+for oc in range(32):
+    for ic in range(16):
+        # Extract 3×3 kernel for this (out_ch, in_ch) pair
+        kernel_3x3 = conv_weight_train[oc, ic, :, :]  # [3, 3]
+        
+        # Flatten to 9-tap vector (row-major order)
+        kernel_flat = kernel_3x3.flatten()  # [0,1,2,3,4,5,6,7,8]
+        
+        # Quantize to Q6.9
+        conv_weight_hw[oc, ic, :] = np.clip(kernel_flat * 512, -32768, 32767)
+
+# Save for DMA streaming
+weights_for_fpga.npz['conv2'] = conv_weight_hw
+```
+
+**During Hardware Execution (pynq_inference.py _run_hw_layer):**
+
+```python
+for group in range(num_groups):  # groups = num_out_ch // 16
+    wgt = conv_weight_hw[group*16:(group+1)*16]  # [16, 16, 9]
+    
+    for in_ch_block in range(16 // 16):  # Simplified: 1 block per group usually
+        # Send weights: [16 out_ch, 1 in_ch, 9 taps] = 144 weights
+        for oc in range(16):
+            for tap in range(9):
+                dma_send(wgt[oc, 0, tap])  # ← 144 weights in order
+        
+        # Then send pixels for 4 rows × 16 input channels × width
+        for row in range(4):
+            for ch in range(16):
+                for col in range(width):
+                    dma_send(pixels[ch, row, col])
+```
+
+---
+
+## 7. PIPELINE LATENCY THROUGH OUTPUT PATH
+
+**Question:** "Why can quantizer run combinatorially but output_pixel_reg needs a register?"
+
+**Answer:** Let's trace the data:
+
+```
+Cycle N:
+  1. FSM asserts out_wr_en (for column C)
+  2. acc_row_buffer starts async read for column C
+     
+Cycle N+1:
+  1. acc_rd_row0 valid (1 cycle after out_wr_en asserted, due to register latency in FSM)
+  2. quantizer processes immediately (comb logic):
+     q_out_row0 = quantize(acc_rd_row0)
+  3. relu also comb:
+     relu_out_row0 = relu(q_out_row0)
+  4. post_relu_row0 = relu_out_row0 (selected via mux)
+  
+Cycle N+2:
+  1. output_pixel_reg <= post_relu_row0 (register on SAME edge as out_wr_en_d)
+  2. out_wr_en_d <= out_wr_en
+  3. out_wr_addr_d <= out_wr_addr
+     
+  All three registers (data, addr, enable) latch on SAME clock edge
+  → No skew
+
+Cycle N+3:
+  1. output_buffer write strobes with out_wr_en_d = 1
+  2. Address = out_wr_addr_d
+  3. Data = out_pixel_reg
+  
+  All synchronized, no glitches
+```
+
+**Why the delay?**
+
+The FSM writes `out_wr_en` combinatorially based on `out_wr_cnt`. But reading the accumulator is async (combinatorial read wire). We need one register cycle to:
+1. Let acc_row_buffer latency propagate (might be registered internally)
+2. Let quantizer logic settle
+3. Register data for output buffer write
+
+This is why `out_pixel_reg` exists: **to synchronize data arrival with the registered address and enable signals.**
+
+---
+
+## 8. COMMON SYNTHESIS CHALLENGES & SOLUTIONS
+
+### Issue 1: Critical Path Through Quantizer
+
+**Problem:**
+```verilog
+wire signed [32:0] rounded = {acc_in[31], acc_in} + 33'sd256;
+wire signed [23:0] shifted = rounded[32:9];  // Multi-level shift
+always @(*) begin
+    if (shifted > 24'sh007FFF)  // Comparison is deep in tree
+        q_out = 16'sh7FFF;
     else if (shifted < -24'sh008000)
-        q_out = 16'sh8000;    // saturate negative
+        q_out = 16'sh8000;
     else
         q_out = shifted[15:0];
 end
 ```
-Key:
-Rounding: Add 256 (= 2^8, which is 0.5 in Q12.18) before shift
-Saturation: Clamp to ±32K (16-bit signed range)
-Combinatorial: Async operation, no registers
-ReLU (relu_unit.v):
-```verilog
-assign data_out = (data_in[15] == 1'b0) ? data_in : 16'sh0000;
-```
-Simple sign-bit check (if MSB=0, positive; if MSB=1, output 0).
-3.7 MaxPool Unit
-Receives 2 pixel values per cycle (from two output rows), computes 2×2 max.
-```
-Input pixels (sequenced):
-  [r0c0] [r0c1]
-  [r1c0] [r1c1]
-  ...
 
-On cycle 2: max(all 4) is ready. On cycle 3: shift and process next quad.
-```
-Mode Selection (in top.v):
-```verilog
-wire apply_relu = (mode == 2'b01) || (mode == 2'b10);
-  // mode=01: conv+relu
-  // mode=10: conv+relu+pool (maxpool receives pre-relu'd data from acc row buffer)
+**Critical Path:** 32-bit add + 24-bit shift + comparison chain = 3 levels of logic → Timing fails @ 100 MHz
 
-wire is_pool = (mode == 2'b10);
-assign out_wr_en_final = is_pool ? pool_valid : out_wr_en;
-```
----
-4. CONTROL & DATAPATH - FSM Controller
-File: control.v
-4.1 FSM State Diagram
-```
-                    ┌─────────┐
-                    │  IDLE   │
-                    └────┬────┘
-                         │ start=1, run_armed guard
-                         ▼
-              ┌──────────────────────┐
-              │  LOAD_WEIGHTS        │
-              │ (DMA expects weights)│
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  WAIT_WEIGHTS        │ ◄──── load_done (TLAST received)
-              │ (Poll for TLAST)     │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  LOAD_INPUT          │
-              │ (Stream pixel data)  │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  WAIT_INPUT          │ ◄──── load_done (TLAST received)
-              │ (Poll for TLAST)     │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  CLEAR_ACC           │ ◄──── Pre-clear accumulators
-              │                      │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  COMPUTE             │ ◄──── Main kernel loop (10 cycles/pixel)
-              │ (tap_cnt 0..11)      │       - tap 0: clear + send addr
-              │                      │       - tap 1..9: MAC
-              └────────┬─────────────┘       - tap 10: last MAC
-                       │ cur_col done       - tap 11: write acc to row buf
-                       ▼
-              ┌──────────────────────┐
-              │  NEXT_GROUP          │ ◄──── 3 input ch × 16 out ch = 6 groups
-              │ (2D input groups)    │       (loop back to LOAD_WEIGHTS)
-              └────────┬─────────────┘
-                       │ all groups done
-                       ▼
-              ┌──────────────────────┐
-              │  WRITE_OUT           │ ◄──── Quantize + ReLU + optional Pool
-              │ (Async acc read)     │       Write 2 rows to output buffer
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  NEXT_ROW_PAIR       │ ◄──── Loop back to LOAD_WEIGHTS
-              │ (2×2 row blocks)     │
-              └────────┬─────────────┘
-                       │ all row pairs done
-                       ▼
-              ┌──────────────────────┐
-              │  STREAM_OUTPUT       │ ◄──── AXI4-Stream the output
-              │ (DMA S2MM reads buf) │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  WAIT_STREAM         │ ◄──── stream_done (all pixels sent)
-              │                      │
-              └────────┬─────────────┘
-                       │
-                       ▼
-              ┌──────────────────────┐
-              │  NEXT_OC             │ ◄──── Outer loop: output channel
-              │ (num_out_ch loop)    │
-              └────────┬─────────────┘
-                       │ all out channels done
-                       ▼
-              ┌──────────────────────┐
-              │  ALL_DONE            │
-              │ (Set done=1, busy=0) │
-              └────────┬─────────────┘
-                       │
-                       └─────────► IDLE
-```
-4.2 Kernel Tap Decomposition - Critical
-Problem: 3×3 kernel = 9 taps. Input row stream has 128 columns. Must fetch from 2D grid.
-Solution: Decompose tap index into row/col offsets:
-```
-tap_cnt sequence: 0..9 (10 cycles per output pixel)
-tap_row_off = tap_cnt / 3  → 0, 0, 0, 1, 1, 1, 2, 2, 2
-tap_col_off = tap_cnt % 3  → 0, 1, 2, 0, 1, 2, 0, 1, 2
-
-BRAM address = (row_base + tap_row_off) × input_w + (col_base + tap_col_off)
-```
-Timing (with 1-cycle BRAM latency):
-```
-Cycle 0: Send BRAM addr for tap0 (tap_cnt=0)
-Cycle 1: (wait) ← tap0 data from BRAM arrives at cycle 2
-Cycle 2: PE_EN fires on tap0 data, send addr for tap1
-Cycle 3: PE_EN fires on tap1 data, send addr for tap2
-...
-Cycle 10: PE_EN fires on tap8 data
-Cycle 11: acc_wr_en fires ← 32-bit accum written to acc_row_buffer
-```
-Total: 12 cycles per output pixel (or 10 after overlap optimization)
-4.3 run_armed Guard - Prevents Spurious Restarts
-Bug Fix Commentary (BUG 8):
-Original issue: If PS sends multiple START commands while FSM is computing, the FSM restarts incorrectly mid-layer.
-Solution: Add `run_armed` latch:
+**Solution:**
 ```verilog
-// In IDLE state:
-if (!run_armed || done_latch_in) begin
-    run_armed <= 1'b1;        // arm on first start
-    // proceed with LOAD_WEIGHTS
+// Option 1: Register intermediate results
+always @(posedge clk) begin
+    rounded_r <= {acc_in[31], acc_in} + 33'sd256;
 end
-// In ALL_DONE state:
-run_armed <= 1'b0;            // disarm only after layer complete
-```
-Handshake with PS:
-PS reads `done_latch_out` to confirm layer is complete
-PS sends next START
-FSM detects `run_armed && done_latch_in` and proceeds to new layer
----
-5. PS/PL INTERFACES & DATA MOVEMENT
-5.1 AXI-Lite Slave (Control Channel)
-Base Address: 0x43C00000  
-Register Map:
-Offset	Name	Bits	Function
-0x00	CTRL	[0]	start
-		[2:1]	mode (00=conv, 01=conv+relu, 10=conv+relu+pool)
-0x04	STATUS	[0]	done
-		[1]	busy
-0x08	IMG_DIM	[7:0]	input_h
-		[15:8]	input_w
-0x0C	OUT_DIM	[7:0]	output_h
-		[15:8]	output_w
-0x10	CH_CFG	[7:0]	num_in_ch
-		[15:8]	num_out_ch
-0x20	LOOP_STAT	[7:0]	cur_oc
-		[15:8]	cur_group
-		[23:16]	cur_row_pair
-		[25:24]	fsm_wait_state (00=busy, 01=wait weights, 10=wait pixels)
-PS Software Flow:
-```python
-# Write configuration
-_wr(REG_IMG_DIM, (input_h << 0) | (input_w << 8))
-_wr(REG_OUT_DIM, (output_h << 0) | (output_w << 8))
-_wr(REG_CH_CFG, (num_in_ch << 0) | (num_out_ch << 8))
-_wr(REG_CTRL, 0x1)  # Assert START
+assign shifted = rounded_r[32:9];
+// Now quantizer runs next cycle
 
-# Poll for done
-while not (_rd(REG_STATUS) & 0x1):
-    time.sleep(0.00001)
+// Option 2: Binary tree add for "shifted" (pipelined sum)
+// Add higher bits first, lower bits in parallel
 ```
-5.2 AXI4-Stream Slave - DMA MM2S (Data In)
-Width: 16-bit (`s_axis_tdata`)
-Valid: `s_axis_tvalid` (asserted by DMA)
-Ready: `s_axis_tready` (asserted by PL when accepting)
-Last: `s_axis_tlast` (marks end of weight or pixel batch)
-Route Selection (route_sel):
-```
-route_sel=0 → weights → weight_regfile[wr_addr]
-route_sel=1 → pixels → input_pingpong_buffer[ch, addr]
-```
-5.3 AXI4-Stream Master - DMA S2MM (Data Out)
-Width: 16-bit (`m_axis_tdata`)
-Valid: `m_axis_tvalid` (PL asserts when data ready)
-Ready: `m_axis_tready` (DMA asserts when it can accept)
-Last: `m_axis_tlast` (marks end of feature map)
-Driven by: `output_stream_controller` module
----
-6. PS SOFTWARE DRIVER (pynq_inference.py)
-6.1 High-Level Inference Flow
-```python
-cnn = CNNInference(bitstream_path, weights_path)
 
-# Layer loop
-for layer_name, in_h, in_w, out_h, out_w, in_ch, out_ch, mode in LAYER_CONFIG:
-    if mode == MODE_PS_POOL:
-        x = _run_ps_pool(name, x, out_h, out_w)  # MaxPool in software
-    else:
-        x = _run_hw_layer(name, x, in_h, in_w, out_h, out_w, 
-                         in_ch, out_ch, mode, wgt_key)  # Conv+ReLU in hardware
+### Issue 2: BRAM Read Latency with Distributed Logic
 
-# PS layers (FC + sigmoid)
-prob = _run_ps_layers(x)  # Flatten + FC1 + ReLU + FC2 + Sigmoid
-```
-6.2 Hardware Layer Execution (Key Points)
-```python
-def _run_hw_layer(self, name, fmap, in_h, in_w, out_h, out_w, 
-                  num_in_ch, num_out_ch, mode, wgt_key):
-    # Step 1: Weight grouping
-    # Conv weight format: [out_ch, groups, 16, 9]
-    # Example: conv3 is [64, 2, 16, 9] = 64 out_ch, 2 groups (32 ch per group)
-    num_groups = num_out_ch // 16
-    
-    # Step 2: For each group (16 output channels at a time)
-    for group in range(num_groups):
-        # Get 16 out_ch × 16 in_ch = 256 weights (144 per input channel)
-        wgt_group = conv_weights[wgt_key][group*16:(group+1)*16]  # [16, 16, 9]
-        
-        # Step 3: DMA weights to PL
-        # FSM is in LOAD_WEIGHTS, polling fsm_wait_state=01
-        # Send 144 weights via AXI4-Stream with TLAST
-        self.dma.sendchannel.start()
-        self.dma.sendchannel.transfer(wgt_group.flatten())
-        self.dma.sendchannel.wait()  # blocks until TLAST consumed
-        
-        # Step 4: Stream input pixels
-        # 4 rows × 16 in_ch × in_w pixels
-        pixel_stream = fmap[:, :4*in_w].reshape(-1)  # flatten
-        self.dma.sendchannel.transfer(pixel_stream)
-        
-        # Step 5: Poll output
-        # FSM computes, writes to output_buffer, streams via AXI4-Stream
-        self.dma.recvchannel.transfer(out_buffer)
-        output_pixels = self.dma.recvchannel.wait()  # blocks until TLAST
-    
-    # Convert from fixed-point Q6.9 → float
-    return output_pixels / 512.0
-```
-6.3 Weight Conversion (Training → Hardware)
-```python
-# From training (float32):
-trained_weight = model.conv1.weight  # shape: [16, 3, 3, 3]
-
-# Hardware format [out_ch, groups, 16_in_ch_or_padded, 9_taps]:
-# - Conv1: 3 input ch → pad to 16 with zeros
-# - Conv2: 16 input ch × 32 output ch = 2 groups
-
-# Quantize to Q6.9:
-def _to_q69(arr):
-    return np.clip(arr * 512, -32768, 32767).astype(np.int16)
-
-wgt_q = _to_q69(trained_weight)
-
-# Save to weights_for_fpga.npz
-np.savez('weights_for_fpga.npz', 
-         conv1_weight=wgt_q_conv1,
-         conv2_weight=wgt_q_conv2,
-         ...)
-```
-6.4 Image Preprocessing
-```python
-def _preprocess(self, img_path):
-    # Step 1: Load and resize
-    img = Image.open(img_path).convert('RGB')
-    img = img.resize((128, 128), Image.BILINEAR)
-    
-    # Step 2: Normalize 0..255 → 0..1
-    img = np.array(img).astype(np.float32) / 255.0
-    
-    # Step 3: Standardize (ImageNet)
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-    img = (img - mean) / std
-    
-    # Step 4: Convert to Q6.9
-    img_q = self._to_q69(img)  # → [-2048, +2048] int16
-    
-    # Step 5: Channel-last → channel-first for hardware
-    # HWC [128, 128, 3] → CHW [3, 128, 128]
-    return np.transpose(img_q, (2, 0, 1))
-```
-6.5 PS-Only MaxPool (Why?)
-```python
-def _run_ps_pool(self, name, fmap, out_h, out_w):
-    # fmap: [in_ch, in_h, in_w]
-    # Perform 2×2 max pooling
-    
-    out = np.zeros((fmap.shape[0], out_h, out_w), dtype=np.int16)
-    for h in range(out_h):
-        for w in range(out_w):
-            out[:, h, w] = np.max(
-                fmap[:, 2*h:2*h+2, 2*w:2*w+2].reshape(fmap.shape[0], -1),
-                axis=1
-            )
-    return out
-```
-Why in software?
-Hardware maxpool is complex (must handle variable channel counts: 16, 32, 64, 96)
-Software is simple numpy and ~1ms per layer on ARM
-Easier than hardware complexity for 4 layers
----
-7. KEY DESIGN DECISIONS & OPTIMIZATIONS
-7.1 Ping-Pong Buffering Strategy
-Problem: DMA load time + compute time can't overlap with single buffer.
-Solution: Two BRAM sets, swapped every row-pair:
-While PE reads from buffer A row 0..3, DMA writes buffer B
-After processing, swap: PE reads B, DMA writes A
-Zero stalling latency
-Benefit: Continuous 100% PE utilization (no wait cycles for data)
-7.2 Group Processing (Depthwise Separability)
-Challenge: Conv1 has 3 input ch, but hardware is 16 PE wide.
-Solution: Logical grouping:
-```
-Conv1: 3 in ch × 16 out ch
-  Group 0: in_ch [0,1,2] + [0,0,...0] → out_ch [0..15]
-
-Conv2: 16 in ch × 32 out ch
-  Group 0: in_ch [0..15] → out_ch [0..15]
-  Group 1: in_ch [0..15] → out_ch [16..31]
-```
-Each group loads new weights, processes all output channels in parallel.
-Benefit: Efficient DSP pipelining; no wasted PE slots
-7.3 Row-Pair Tiling
-Why 2 rows at a time?
-Two 3×3 kernels produce 2 output rows from 4 input rows (with overlap).
-```
-Input:     Output:
-row 0 ┐      row 0 (from rows 0,1,2)
-row 1 ┼ ──→ row 1 (from rows 1,2,3)
-row 2 ┤
-row 3 ┘
-```
-This 2-row output naturally stores in dual-ported acc_row_buffer.
-7.4 Quantization Happens Post-MAC
-Not during MAC:
-DSP accumulator is 48-bit native, but we use 32-bit (C12.18 is enough)
-Quantization after summation across 16 channels avoids intermediate saturation losses
-Rounding Strategy:
-Add 256 (0.5 LSB in Q12.18) before right-shift by 9
-Ensures round-to-nearest, not truncation
-Reduces quantization error vs. training
-7.5 ReLU & MaxPool Bypass Logic
+**Problem:**
 ```verilog
-wire apply_relu = (mode == 2'b01) || (mode == 2'b10);
-wire is_pool = (mode == 2'b10);
-
-// Mode 00 (conv only):        quantize → output
-// Mode 01 (conv+relu):         quantize → relu → output
-// Mode 10 (conv+relu+maxpool): quantize → relu → pool → output
-```
-This allows reusing the same quantizer+relu pipeline for multiple modes.
----
-8. BUG FIXES & CRITICAL ISSUES
-BUG 1: Missing Channel Summer (CRITICAL)
-File: top.v, line 316-322
-Original (BROKEN):
-```verilog
-// wire signed [31:0] ch_sum;
-// channel_summer u_summer (...);
-wire signed [31:0] ch_sum = 32'h00020000;  // HARDCODED CONSTANT!
-```
-Issue: All convolution outputs were replaced with a debug constant 0x00020000 (Q12.18 = 62.5). No actual MAC results computed!
-Fix:
-```verilog
-channel_summer u_summer (
-    .acc_in  (pe_acc_flat),
-    .sum_out (ch_sum)
-);
-```
-Interview Angle:
-Demonstrates testing rigor: how did this pass initial testing?
-Answer: "Likely caught during waveform inspection + output validation against reference (e.g., PyTorch golden output)"
-BUG 2: Output Pipeline Register Reset
-File: top.v, lines 146-173
-Original (RACE):
-```verilog
-reg out_pixel_reg;
-reg out_wr_addr_d;
-reg out_wr_en_d;
-
-// These used DIFFERENT resets or SOME had no reset
-always @(posedge clk) begin  // NO async reset!
-    out_wr_en_d <= out_wr_en_final;
+// User forgets BRAM is registered output
+assign pixel = bram_output[0];  // Combinatorial wire
+assign product = pixel * weight;
+always @(posedge clk) begin
+    acc <= acc + product;  // But pixel is 1 cycle stale!
 end
 ```
-Issue: After power-up reset assertion then de-assertion, some registers held undefined X values, corrupting output data.
-Fix:
+
+**Solution:**
 ```verilog
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-        out_wr_en_d <= 1'b0;
-    else
-        out_wr_en_d <= out_wr_en_final;
+// Account for 1-cycle BRAM latency in FSM tap_cnt sequencing
+// Cycle 0: send addr
+// Cycle 1: data not ready yet, wait
+// Cycle 2: data valid, MAC fires
+
+// Verified by simulation: check waveform alignment of
+// bram_rd_addr (cycle 0) with bram_rd_data (cycle 2)
+```
+
+### Issue 3: Generate Loops with Bus Indexing
+
+**Problem:**
+```verilog
+// WRONG: won't synthesize correctly in all tools
+wire [16*16-1:0] pixels;
+for (ch = 0; ch < 16; ch = ch + 1) begin
+    assign pixel_single[ch] = pixels[16*ch+15:16*ch];
 end
 ```
-Lesson: All sequential logic must have consistent async reset for FPGA design quality.
-BUG 5: Register Width (cur_row_pair)
-File: control.v + pynq_inference.py
-Original:
+
+**Solution:**
 ```verilog
-// control.v line 66: cur_row_pair is [7:0] (full 8-bit)
-output reg  [7:0]  cur_row_pair;
-```
-Original (Python):
-```python
-# pynq_inference.py line 139:
-cur_row_pair = (val >> 16) & 0x7F  # ONLY 7 bits extracted!
-```
-Issue: If output_h > 127, cur_row_pair would wrap, confusing PS.
-Fix:
-```python
-cur_row_pair = (val >> 16) & 0xFF  # full 8 bits
-```
-BUG 7: Debug Counter Reset
-File: input_buf.v
-Original:
-```verilog
-reg [31:0] dbg_write_count;
-
-always @ (posedge clk) begin  // NO reset clause
-    if (wr_en)
-        dbg_write_count <= dbg_write_count + 1;
-end
-```
-Issue: After power-up, dbg_write_count held X, spamming simulation with X's.
-Fix:
-```verilog
-always @ (posedge clk or negedge rst_n) begin
-    if (!rst_n)
-        dbg_write_count <= 32'd0;
-    else if (wr_en)
-        dbg_write_count <= dbg_write_count + 1;
-end
-```
-BUG 8: run_armed Guard
-File: control.v, lines 172-180
-Original (MISSING):
-```verilog
-// No guard; any START would restart compute mid-layer
-if (start) begin
-    run_armed     <= 1'b1;
-    // proceed
-end
-```
-Issue: If PS polled STATUS and saw busy=0 briefly, then sent START again, FSM would restart incorrectly.
-Fix:
-```verilog
-if (!run_armed || done_latch_in) begin
-    run_armed     <= 1'b1;
-    // proceed with LOAD_WEIGHTS
-end
-```
-Only disarm in ALL_DONE after confirmed completion.
----
-9. PERFORMANCE ANALYSIS
-9.1 Throughput Calculation
-Conv1 (3→16 channels, 128×128→126×126):
-```
-Output pixels: 126 × 126 = 15,876
-Input channels: 3 (padded to 16 in hardware)
-Groups: 1 (3 input ch, 16 output ch)
-Taps per output: 9 (3×3 kernel)
-
-Cycle breakdown per output pixel:
-  - tap_cnt 0: address + clear
-  - tap_cnt 1: wait for tap0 data
-  - tap_cnt 2..9: MAC (8 cycles)
-  - tap_cnt 10..11: final MAC + write accumulator
-  
-  Total: ~12 cycles per output pixel (conservative)
-  
-Compute time: 15,876 × 12 ≈ 190K cycles
-Clock rate: 100 MHz (Zynq typical)
-Compute latency: 190K / 100M = 1.9 ms
-
-Add overhead:
-  - DMA setup, weight load: ~0.2 ms
-  - Quantize/ReLU/Pool: ~0.1 ms
-  - Total: ~2.2 ms per layer
-```
-4-Layer Pipeline (estimated):
-Conv1 + Pool1: 2.2 ms
-Conv2 + Pool2: 1.2 ms (smaller feature maps)
-Conv3 + Pool3: 0.6 ms
-Conv4 + Pool4: 0.3 ms (12×12 very small)
-Total PL compute: ~4.3 ms
-PS layers (CPU):
-FC1: 128 × 3456 ≈ 0.4 ms (ARM Cortex-A9 ~200 MHz)
-FC2: 1 × 128 ≈ 0.05 ms
-Total PS: ~0.45 ms
-Total inference: ~4.75 ms end-to-end (on PYNQ-Z2)
-9.2 Resource Utilization (Zynq-7020)
-Resource	Available	Used	%
-LUT	53,200	~15K	28%
-BRAM	140	~35	25%
-DSP48E1	220	16	7%
-BUFG	32	~4	12%
-Limiting factor: BRAM (32 BRAMs for input buffer) → prevents scaling to 32 input channels without external memory.
-9.3 Memory Bandwidth Analysis
-DMA Input Bandwidth (100 MHz):
-Per cycle: 16 bits × 100 MHz = 12.8 Gbps = 1.6 GB/s
-Conv1: 3 channels × 128×128 = 49K pixels = 98 KB
-@ 1.6 GB/s: load in ~60 µs (negligible)
-Weight Streaming:
-144 weights × 2 bytes = 288 bytes per layer
-Completely overlapped with compute
-Output Streaming:
-126×126 outputs = 15,876 × 2 bytes = 31.75 KB
-@ 1.6 GB/s: stream out in ~20 µs
-Conclusion: Zero memory bandwidth bottleneck. Compute-bound. Could improve with:
-Wider DMA (32-bit or 64-bit AXI4-Stream) → not implemented for simplicity
-Larger DSP array (e.g., 32 PEs instead of 16)
----
-10. INTERVIEW TALKING POINTS (NVIDIA-SPECIFIC)
-10.1 Parallelism & Data Locality
-What NVIDIA cares about:
-How do you exploit hardware parallelism?
-How do you minimize data movement?
-Your Answer:
-> "The PE array uses 16 parallel DSP48E1 slices, each computing one input channel × all output channels per kernel tap. This gives 16× parallelism for free (one PE per input channel). The ping-pong BRAM buffer keeps data resident on-chip; pixels arrive via DMA once and stay in buffer during entire group compute (all output channels). This minimizes DDR round-trips and matches the FPGA's high local bandwidth (~12 GB/s BRAM) vs. limited DDR bandwidth."
-10.2 Fixed-Point Quantization & Numerical Precision
-What NVIDIA cares about:
-Can you design numeric pipelines?
-Do you understand quantization tradeoffs?
-Your Answer:
-> "The design uses Q6.9 (6 integer, 9 fractional) for pixels/weights (16-bit) and Q12.18 for accumulators (32-bit). This preserves precision through the MAC operation (16×16 → 32-bit is natural DSP output). Quantization to Q6.9 uses round-to-nearest (add 256 before shift) and saturation to avoid training-inference mismatch. I verified numerically on PyTorch golden outputs that 9 fractional bits provide < 0.5% error vs. float32, sufficient for a dog/cat classifier."
-10.3 Timing Closure & Design Tradeoffs
-What NVIDIA cares about:
-Did you close timing?
-What were the critical paths?
-Would you change anything?
-Your Answer:
-> "Post-implementation, timing closed at 100 MHz. Critical path was through the DSP multiplier + adder chain in the PE array. I initially had combinatorial rounding logic after the DSP accumulator (3 levels of logic: add 256, shift, saturate), which violated setup time. Fixed by pipelining the quantizer—it now takes the post-relu'd output one cycle later, which is acceptable since output pixels are buffered anyway. The quantizer could run at 150 MHz with register stages between add/shift/saturate."
-10.4 Streaming Dataflow & Backpressure
-What NVIDIA cares about:
-Can you design streaming pipelines?
-Do you handle flow control?
-Your Answer:
-> "The AXI4-Stream interfaces handle backpressure naturally. If the output buffer fills (output_stream_controller can't drain fast enough), m_axis_tvalid goes low, which stalls the quantizer write pipeline (out_wr_en). The FSM is decoupled; it continues pushing data to the accumulator, which is memory-buffered. Once output drains, quantizer resumes. This prevents data loss and handles bursty DMA."
-10.5 Design for Scalability
-What NVIDIA cares about:
-Can you extend this to larger models?
-Your Answer:
-> "Current bottleneck is BRAM (32 instances). To scale to 32 input channels, I'd need 64 BRAM instances. Two options:
-> 1. **Dual-DMA strategy**: Alternate buffering in two stages (buffer first 16 ch, then second 16 ch), compute in between → same area, 2× latency.
-> 2. **External HBM**: Stream from Zynq's DDR directly (via AXI HP ports), sacrifice latency for area.
-> 
-> For larger models (ResNet-50), I'd also increase DSP width (32 PEs instead of 16) and parallelize more layers (pipeline multiple row-pairs concurrently via duplicate compute cores). Vivado's resource constraint tools help identify these limits early."
----
-11. TEST STRATEGY & VALIDATION
-11.1 Unit Testing (Before Integration)
-```python
-# Test PE unit (simulation)
-- Verify MAC operation: pixel × weight → accumulate
-- Check clear/enable priority (tap 0 loads, taps 1..8 accumulate)
-- Quantization: test rounding and saturation
-
-# Test channel_summer (simulation)
-- Add 16 random 32-bit values
-- Verify against numpy sum
-
-# Test input_buffer (simulation)
-- Write data to one channel, read from all
-- Check ping-pong swap
-
-# Test quantizer (simulation)
-- Q12.18 values covering full range
-- Verify round-to-nearest within 1 LSB
-```
-11.2 Integration Testing (Full PL)
-```python
-# Test 1: Known weights (identity + offset)
-- Weights = [0, 0, 1, 0, 0, 0, 0, 0, 0] (center tap = 1)
-- Input = checkerboard pattern
-- Output should be input (center pixel preserved)
-
-# Test 2: PyTorch golden (small test case)
-- Run 3×8×8 image through PyTorch Conv1
-- Quantize outputs to Q6.9
-- Load weights, image into PL
-- Compare outputs (expect < 1% error)
-
-# Test 3: Full pipeline (all 4 layers)
-- End-to-end PYNQ inference
-- Compare PS flatten + FC outputs vs. training script
-```
-11.3 Hardware Validation (On Board)
-```bash
-# Load bitstream
-$ fpgautil -b design_1.bit
-
-# Run inference
-$ python3 pynq_inference.py /home/xilinx/test_dog.jpg
-$ python3 pynq_inference.py /home/xilinx/test_cat.jpg
-
-# Check metrics
-$ python3 -c "
-  from pynq_inference import CNNInference
-  cnn = CNNInference()
-  
-  # Measure latency
-  import time
-  t0 = time.time()
-  prob, label = cnn.predict('test.jpg')
-  print(f'Latency: {(time.time()-t0)*1000:.1f}ms')
-  print(f'Accuracy on test set: {num_correct}/{num_total}')
-"
-```
----
-12. COMMON INTERVIEW QUESTIONS & ANSWERS
-Q1: "How would you improve throughput by 2×?"
-Answer Options:
-Option A (PE array):
-> "Increase PE count to 32 (double width). This requires 32 DSP slices (still available: 220 total). Weight regfile grows to 256 words. BRAM count stays same. Would achieve 2× throughput on most layers. Bottleneck shifts to external memory (DDR) for larger models."
-Option B (Pipelining):
-> "Overlap compute stages: e.g., while one row-pair computes (tap_cnt 0..11), start loading next row-pair via DMA into alternate buffer. Requires state machine refactor but same hardware. Achieves ~1.5× improvement (not perfect 2× due to group serial dependency)."
-Option C (Memory):
-> "Current DDR bandwidth is underutilized (~10% of potential). Use wider DMA (32-bit AXI4-Stream instead of 16-bit). This requires protocol changes but doubles pixel throughput into input buffer. Would be limiting factor if extended to ResNet-50."
-Q2: "What's the biggest limitation of your design?"
-Answer:
-> "BRAM count (32 instances used out of 140 available). Each input channel requires 1 BRAM per buffer (2 buffers = 2 BRAMs per channel × 16 = 32 BRAM). Can't scale to 32+ input channels without external memory. For production, I'd design a hierarchical BRAM + HBM solution: small BRAM cache for current tile, HBM for full feature maps. This adds complexity but supports modern networks."
-Q3: "How do you handle rounding and quantization errors?"
-Answer:
-> "Two approaches:
-> 1. **In hardware**: Round-to-nearest during accumulator right-shift (add 0.5 LSB before shift). Saturate to ±32K to avoid wraparound.
-> 2. **In training**: Quantize-aware training (QAT). Train the network with Q6.9 quantization from epoch 1, so weights adapt to fixed-point. Achieves < 0.5% accuracy loss on my dog/cat classifier.
-> 
-> I also validate via **reference comparison**: compute same layer in PyTorch float32, quantize to Q6.9, compare to hardware output pixel-by-pixel. Differences < 1 count are acceptable (rounding), > 1 count indicate bugs (e.g., BUG 1 where channel summer was hardcoded)."
-Q4: "Describe the PS/PL handshake in detail."
-Answer:
-> "Three-phase handshake:
-> 
-> **Phase 1 - Setup (PS → PL via AXI-Lite):**
-> - Write configuration (input_h, input_w, output_h, output_w, num_in_ch, num_out_ch)
-> - Write mode (00=conv, 01=conv+relu, 10=pool)
-> - Assert START bit (CTRL[0])
->
-> **Phase 2 - Data Exchange (DMA AXI4-Stream):**
-> - FSM goes to LOAD_WEIGHTS, sets fsm_wait_state = 01
-> - PS polls LOOP_STAT[25:24] and sees 01
-> - PS initiates DMA MM2S of weight data, asserts TLAST at end
-> - FSM receives TLAST via input_stream_controller, loads next state
-> - Repeat for pixels: fsm_wait_state = 10, PS sends pixels via MM2S
->
-> **Phase 3 - Completion (Polling):**
-> - FSM computes, streams output via S2MM (DMA reads via AXI4-Stream Master)
-> - When done, FSM sets done = 1
-> - PS polls STATUS[0] and sees done = 1
-> - PS reads LOOP_STAT to see final layer metrics (cur_oc, etc.)
-> 
-> This design allows PS to implement arbitrary DMA sequencing without hardware signaling complexity."
-Q5: "What's one thing you'd do differently?"
-Answer:
-> "In retrospect, I'd **pipeline the output path** to reduce critical path. Currently, output_pixel_reg stores quantized data same cycle it's written, forcing quantizer logic to complete within one clock period. If I added one more pipeline stage (output_pixel_d) with pre-ReLU buffering, the quantizer could run at 150 MHz instead of 100 MHz, improving timing margin.
-> 
-> Second, I'd **parameterize the PE count** in the Verilog so it's easy to synthesize 8, 16, or 32 PE variants from the same RTL. Currently, it's hardcoded to 16. This would make it easier to trade area for throughput on different FPGA boards."
----
-13. KEY VERILOG PATTERNS & SYNTHESIS DIRECTIVES
-13.1 DSP Inference Pragmas
-```verilog
-// Force use of DSP48E1 for multipliers
-(* use_dsp = "yes" *)
-wire signed [31:0] product = pixel * weight;
-
-// Alternative: distributed logic (if DSP oversubscribed)
-(* use_dsp = "no" *)
-wire [31:0] product = ...;
-```
-13.2 BRAM Inference
-```verilog
-// True dual-port BRAM (Xilinx inference)
-module bram_dp #(
-    parameter WIDTH = 16,
-    parameter DEPTH = 512,
-    parameter AWIDTH = 9
-)(
-    input clk, wr_en,
-    input [AWIDTH-1:0] wr_addr, rd_addr,
-    input [WIDTH-1:0] wr_data,
-    output reg [WIDTH-1:0] rd_data
-);
-    (* ram_style = "block" *)
-    reg [WIDTH-1:0] mem [DEPTH-1:0];
-    
-    always @(posedge clk) begin
-        if (wr_en)
-            mem[wr_addr] <= wr_data;
-        rd_data <= mem[rd_addr];  // registered output
-    end
-endmodule
-```
-13.3 Generate Loop for Parallel Instantiation
-```verilog
+// Use parameter-based indexing
 generate
-    for (ch = 0; ch < NUM_CH; ch = ch + 1) begin : PE_ARRAY
+    for (ch = 0; ch < NUM_CH; ch = ch + 1) begin : CH_LOOP
+        // Bit width must be explicit
+        wire [15:0] pixel_ch = pixels[16*ch+15:16*ch];
+        
         pe_unit u_pe (
-            .pixel(pixel_flat[16*ch+15:16*ch]),
-            .weight(weight_flat[16*ch+15:16*ch]),
-            .acc(acc_flat[32*ch+31:32*ch])
+            .pixel(pixel_ch),
+            ...
         );
     end
 endgenerate
 ```
-Interview tip: Explain why generate loops are needed (parameterization, synthesis, scalability).
----
-14. SUMMARY TABLE - LAYER-BY-LAYER SPECS
-Layer	Mode	In CH	Out CH	In H×W	Out H×W	Groups	Est. Latency
-Conv1	Conv+ReLU	3	16	128×128	126×126	1	2.2 ms
-Pool1	MaxPool (PS)	16	16	126×126	63×63	1	0.8 ms
-Conv2	Conv+ReLU	16	32	63×63	61×61	2	1.2 ms
-Pool2	MaxPool (PS)	32	32	61×61	30×30	1	0.4 ms
-Conv3	Conv+ReLU	32	64	30×30	28×28	4	0.6 ms
-Pool3	MaxPool (PS)	64	64	28×28	14×14	1	0.2 ms
-Conv4	Conv+ReLU	64	96	14×14	12×12	6	0.3 ms
-Pool4	MaxPool (PS)	96	96	12×12	6×6	1	0.05 ms
-Total PL	—	—	—	—	—	—	4.3 ms
-Flatten → FC1 → ReLU → FC2 → Sigmoid	PS only	—	—	—	—	—	0.45 ms
-Total Inference	—	—	—	—	—	—	≤ 4.75 ms
----
-15. FINAL PREPARATION CHECKLIST
-Before Your Interview
-[ ] Understand the full datapath: Pixel → BRAM → PE → Accumulator → Quantizer → ReLU → Pool → Output BRAM → DMA
-[ ] Memorize key numbers: 16 PE, 32 BRAM, 100 MHz, ~4.75 ms total, Q6.9/Q12.18 formats
-[ ] Be ready to discuss tradeoffs: BRAM vs. throughput, DSP vs. LUT, pipelining vs. area
-[ ] Prepare block diagrams: Hand-draw PE, channel summer, ping-pong buffer on whiteboard
-[ ] Explain the FSM: Be able to walk through LOAD_WEIGHTS → WAIT → LOAD_INPUT → COMPUTE → WRITE_OUT sequence
-[ ] Know the bugs: Explain each bug fix and what it taught you about FPGA design
-[ ] Quantization deep dive: Q6.9/Q12.18, rounding, saturation, why those formats
-[ ] PS/PL handshake: AXI-Lite for control, AXI4-Stream for data, fsm_wait_state polling
-[ ] Synthesis pragmas: Understand `use_dsp`, `ram_style` directives
-[ ] Answer scalability questions: How to extend to ResNet-50, higher throughput, more PEs
-[ ] Practice explaining tradeoffs: Why ping-pong vs. other buffering? Why groups vs. full-batch? Etc.
-Example Whiteboard Question (Likely to Come Up)
-"Draw the data path for one output pixel, from input pixel to quantized output. Label every stage and indicate bit widths and latency."
-```
-Pixel (Q6.9, 16-bit) ─┐
-                      ├─► [DSP Multiplier] ──► Product (Q12.18, 32-bit)
-Weight (Q6.9, 16-bit)─┘                            │
-                                                   ▼
-                                        [PE Accumulator] (9 taps)
-                                                   │
-                                                   ▼
-                                    [Channel Summer] (16→1 sum)
-                                                   │
-                                                   ▼
-                              [Acc Row Buffer] (async read, no wait)
-                                                   │
-                                                   ▼
-                              [Quantizer] +256 >> 9 (combinatorial)
-                                                   │
-                                                   ▼
-                              [ReLU] (sign check, combinatorial)
-                                                   │
-                                                   ▼
-                              [Output Buffer] (write, 1 cycle latency)
-                                                   │
-                                                   ▼
-                              [AXI4-Stream Master] ──► DMA S2MM → DDR
 
-Latencies:
-  - DSP multiply: 2.5 ns (1 cycle @ 100 MHz)
-  - 9-tap accumulation: 9 cycles
-  - Channel sum: 1 cycle (tree) or pipelined
-  - Quantize: 1 cycle (after pipelining fix)
-  - ReLU: 0 cycles (combinatorial)
-  - Total: ~10-11 cycles per output pixel
-```
 ---
-CLOSING THOUGHTS FOR NVIDIA INTERVIEW
-Your project demonstrates:
-End-to-end system thinking: You didn't just design an RTL block; you built a complete PS/PL pipeline with software drivers.
-Optimization mindset: Ping-pong buffering, group processing, quantization strategy all show thoughtful tradeoff analysis.
-Real debugging skills: Bug fixes (especially BUG 1, the hardcoded constant) show you validated against golden outputs.
-Hardware expertise: DSP pragmas, BRAM inference, timing closure, fixed-point arithmetic all align with NVIDIA's GPU driver/compiler needs.
-Scalability awareness: You can articulate how to extend to 32 PEs, larger models, and address memory bandwidth.
-At NVIDIA, these skills matter:
-GPU design involves similar streaming dataflow (warp scheduling, cache hierarchies)
-Fixed-point and custom numeric formats (TensorFloat32, bfloat16, etc.)
-Timing closure and power optimization
-DMA and memory hierarchy design
+
+## 9. DEBUGGING: WAVEFORM INSPECTION CHECKLIST
+
+When simulation doesn't match golden output:
+
+```
+[ ] Check pixel data reaches PE:
+    - bram_rd_addr correctly addresses input rows/cols
+    - rd_flat contains expected pixel values
+    - Pixel appears at PE input 1 cycle after BRAM read
+
+[ ] Check weight data reaches PE:
+    - wgt_wr_en strobes 144 times per layer
+    - wgt_rd_tap cycles through 0..8 per tap
+    - wgt_rd_flat contains expected kernel weights
+
+[ ] Check MAC arithmetic:
+    - product_[ch] = pixel × weight in Q12.18
+    - product magnitude seems reasonable (no accidental sign flip)
+    - acc_[ch] accumulates correctly over 9 taps
+
+[ ] Check channel summation:
+    - ch_sum = ∑(acc_[ch]) across 16 channels
+    - Compare to numpy: sum(pe_accs) in Python
+
+[ ] Check quantizer:
+    - q_out = (rounded[32:9]) with saturation
+    - q_out should match: np.clip(ch_sum + 256) >> 9), ±32K)
+
+[ ] Check ReLU:
+    - relu_out = (q_out[15] == 0) ? q_out : 0
+    - OR: relu_out = max(0, q_out) in float comparison
+
+[ ] Check output buffer writes:
+    - out_wr_addr sequences correctly
+    - out_wr_en strobes for each pixel
+    - out_wr_data = relu_out (not quantized, not accumulated, not weight)
+
+[ ] Check DMA stream output:
+    - m_axis_tvalid toggles as buffer drains
+    - m_axis_tdata matches output buffer reads
+    - m_axis_tlast pulses at end of feature map
+```
+
+---
+
+## 10. PERFORMANCE PROFILING
+
+### Measuring Wall-Clock Time on PYNQ-Z2
+
+```python
+import time
+
+# Time one layer
+start = time.time()
+prob, label = cnn.predict('/path/to/test.jpg')
+elapsed_ms = (time.time() - start) * 1000
+
+print(f"Total inference: {elapsed_ms:.1f} ms")
+print(f"  Conv1: 2.2 ms")
+print(f"  Pool1: 0.8 ms (PS)")
+print(f"  Conv2: 1.2 ms")
+print(f"  Pool2: 0.4 ms (PS)")
+print(f"  ...")
+
+# Profiling with hardware cycle counter
+# Could add cycle counter in PL:
+#   output reg [31:0] cycle_counter;
+#   always @(posedge clk) cycle_counter <= cycle_counter + 1;
+#
+# Read via MMIO:
+#   cycles_per_layer = _rd(0x40)
+#   ps_cycles = (cycles / 100e6) * 1000  # assuming 100 MHz
+```
+
+### Bottleneck Analysis
+
+```
+Is compute-bound or memory-bound?
+
+If 100% compute:
+  Latency = (output_pixels × 12 cycles) / 100 MHz
+  Conv1: 15876 × 12 / 100M = 1.9 ms
+  
+If memory-bound:
+  Latency = (DDR bandwidth limit) / (data throughput)
+  Current: 16-bit wide, 100 MHz = 1.6 GB/s effective
+  Feature map: 15876 × 2 bytes = 31 KB (negligible)
+  So not memory-bound for this model
+
+Conclusion: Compute-bound. Could improve by:
+  - Increase PE count (16 → 32)
+  - Reduce cycles/pixel (optimize FSM)
+  - Higher clock frequency (100 → 150 MHz possible with pipelining)
+```
+
+---
+
+## FINAL TIPS FOR NVIDIA INTERVIEW
+
+1. **Be ready to draw the architecture on a whiteboard** without notes.
+2. **Understand the fixed-point math deeply.** NVIDIA cares about numeric precision.
+3. **Explain tradeoffs:** Why Q6.9 over Q8.8? Why 16 PEs over 32? etc.
+4. **Discuss alternative implementations:** Software vs. hardware, CPU vs. GPU, etc.
+5. **Be confident about the bugs you found.** Shows rigor and debugging skill.
+6. **Think scalability first.** "How would this extend to ResNet?" is a common follow-up.
+7. **Know the interfaces cold:** AXI-Lite, AXI4-Stream, exact handshaking sequence.
+8. **Timing closure is real.** Show you understand critical paths and pipelining solutions.
+
 Good luck! 🚀
+
